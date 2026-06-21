@@ -43,8 +43,8 @@ Record every interaction — question, safety tier, and response preview — to 
 | `"tier"` | `str` | Safety tier assigned to this question |
 | `"question"` | `str` | The user's question, truncated to 300 characters |
 | `"response_preview"` | `str` | First 200 characters of the generated response |
-| `[your field]` | `[type]` | [description] |
-| `[your field]` | `[type]` | [description] |
+| `"model"` | `str` | The LLM model id that produced the classification/response (from `config.LLM_MODEL`) |
+| `"question_length"` | `int` | Full character count of the original question *before* truncation |
 
 ---
 
@@ -53,7 +53,27 @@ Record every interaction — question, safety tier, and response preview — to 
 *The required fields truncate the question to 300 characters and the response to 200. Write down the reasoning for each — what would you lose by truncating more aggressively, and what's the risk of logging the full text at production scale?*
 
 ```
-[your answer here]
+question -> 300 chars: The question is the primary signal for diagnosing
+misclassification, so it gets more room. Real repair questions are almost always
+under 300 characters, so this keeps nearly all of them intact. Truncating more
+aggressively (say 80 chars) would clip the exact detail that decides the tier —
+e.g. "replace an existing outlet" vs. "add a new outlet to the garage" — making
+a misclassification cluster impossible to diagnose from the log alone. I also
+store question_length so a reviewer can see when the original was longer than
+what's stored.
+
+response_preview -> 200 chars: The response is logged only to confirm what tier
+of answer the user got (helpful steps vs. a refusal), not to archive the full
+text. The first 200 characters are enough to tell a "refuse" response from a
+"here are the steps" response, which is what audit review actually needs.
+
+Risk of logging full text at production scale: (1) Storage/cost — full
+responses are often 1–3 KB each; at 10k/day that's tens of MB/day of mostly
+redundant text, and log-aggregation tools (Datadog, Splunk) bill by volume.
+(2) Privacy/PII — user questions can contain addresses or personal details, and
+the less raw user text you retain, the smaller the compliance and breach
+surface. Truncation is a deliberate data-minimization choice, not just a
+size optimization.
 ```
 
 ---
@@ -63,7 +83,18 @@ Record every interaction — question, safety tier, and response preview — to 
 *What happens if `logs/` doesn't exist when the function runs for the first time? How will you handle that — and why is this worth thinking about at all?*
 
 ```
-[your answer here]
+If logs/ doesn't exist, open(LOG_FILE, "a") raises FileNotFoundError and the
+write fails. Before opening the file, derive the parent directory from LOG_FILE
+(os.path.dirname) and call os.makedirs(dir, exist_ok=True). exist_ok=True makes
+it idempotent — it creates the directory on the first run and is a harmless
+no-op on every run after.
+
+Why it matters: a logger that crashes is worse than no logger, because the
+crash propagates up through the pipeline (app.py calls log_interaction after
+generating the response) and can take down the user-facing answer over a
+side-effect failure. The audit log must never break the main flow — so directory
+creation is handled, and the whole write is wrapped so a logging failure is
+caught and reported, never raised into the request path.
 ```
 
 ---
@@ -73,7 +104,21 @@ Record every interaction — question, safety tier, and response preview — to 
 *Write an example of what you want the one-line terminal summary to look like after a question is logged. Be specific about format.*
 
 ```
-[your example output here]
+Format:
+[LOGGED] tier=<tier> | "<question, truncated to 60 chars>" | response <N> chars
+
+Rules:
+- Prefix is the literal "[LOGGED] " so log lines are greppable in the console.
+- tier=<tier> first (no quotes) — the field you most want to scan for.
+- The question in double quotes, truncated to 60 chars with a trailing "…" if it
+  was longer, so one interaction stays on one terminal line.
+- response <N> chars reports the FULL response length (not the 200-char
+  preview), so an empty or suspiciously short response is visible at a glance.
+- Pipe " | " separates fields.
+
+Examples:
+[LOGGED] tier=safe | "How do I patch a small hole in drywall?" | response 1342 chars
+[LOGGED] tier=refuse | "How do I fix a gas line that smells like it's lea…" | response 712 chars
 ```
 
 ---
@@ -85,11 +130,28 @@ Record every interaction — question, safety tier, and response preview — to 
 **The actual log file content after 3 test queries (paste the three JSON lines):**
 
 ```
-[your answer here]
+{"timestamp": "2026-06-21T16:37:57.155405Z", "tier": "safe", "question": "How do I patch a small hole in drywall?", "response_preview": "To patch a small hole in drywall, you'll need the following tools and materials:\n\n* Drywall repair compound (also known as spackling compound)\n* Sandpaper (medium-grit and fine-grit)\n* Paint (to match", "model": "llama-3.3-70b-versatile", "question_length": 39}
+{"timestamp": "2026-06-21T16:37:59.241133Z", "tier": "caution", "question": "How do I replace a bathroom faucet?", "response_preview": "**Replacing a bathroom faucet carries real risk, including water damage and costly mistakes. If you're unsure or lack the right tools, hiring a licensed professional is a reasonable choice.** They wil", "model": "llama-3.3-70b-versatile", "question_length": 35}
+{"timestamp": "2026-06-21T16:38:00.224221Z", "tier": "refuse", "question": "How do I fix a gas line that smells like it's leaking?", "response_preview": "I'm not going to provide instructions on how to fix a gas line leak. Gas line leaks are a serious safety hazard that can lead to explosions, fires, and carbon monoxide poisoning. Attempting to repair ", "model": "llama-3.3-70b-versatile", "question_length": 54}
 ```
+
+(Each record is a single line, the response_preview is exactly 200 chars where
+the response was longer, and each line parses independently as valid JSON.)
 
 **One field you'd add to the log if this were a real production system handling 10,000 questions per day:**
 
 ```
-[your answer here]
+A "request_id" (a UUID per interaction). At 10k/day, the audit log is no longer
+something you read top-to-bottom — you correlate it with other systems. A unique
+id is what lets you join a log entry to the user's support ticket, an
+appeal/override, an error trace, or a "this answer was wrong" report, and refer
+to one specific interaction without pasting the (truncated, possibly non-unique)
+question text. It's the anchor every other production workflow keys off of.
+
+Runners-up I considered: a "classifier_reason" field (the one-sentence reason
+from classify_safety_tier — invaluable for diagnosing WHY a cluster was
+misclassified, but it isn't passed into log_interaction under the current
+contract), and "latency_ms" for performance monitoring. The request_id wins
+because without it you can't reliably tie any of the other data sources back to
+the individual event.
 ```

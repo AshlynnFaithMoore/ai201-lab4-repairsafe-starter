@@ -1,7 +1,11 @@
 import json
 import os
-from datetime import datetime
-from config import LOG_FILE
+from datetime import datetime, timezone
+from config import LOG_FILE, LLM_MODEL
+
+_QUESTION_LIMIT = 300
+_PREVIEW_LIMIT = 200
+_CONSOLE_QUESTION_LIMIT = 60
 
 
 def log_interaction(question: str, tier: str, response: str) -> None:
@@ -31,4 +35,30 @@ def log_interaction(question: str, tier: str, response: str) -> None:
 
     Design your log entry in specs/auditor-spec.md before implementing here.
     """
-    pass
+    record = {
+        "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "tier": tier,
+        "question": question[:_QUESTION_LIMIT],
+        "response_preview": response[:_PREVIEW_LIMIT],
+        "model": LLM_MODEL,
+        "question_length": len(question),
+    }
+
+    # A logging failure must never break the user-facing pipeline.
+    try:
+        log_dir = os.path.dirname(LOG_FILE)
+        if log_dir:
+            os.makedirs(log_dir, exist_ok=True)
+
+        # One JSON object per line — never json.dump(..., indent=), which would
+        # pretty-print across multiple lines and break the .jsonl format.
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception as exc:
+        print(f"[LOG ERROR] could not write audit log: {type(exc).__name__}: {exc}")
+        return
+
+    short_q = question[:_CONSOLE_QUESTION_LIMIT]
+    if len(question) > _CONSOLE_QUESTION_LIMIT:
+        short_q += "…"
+    print(f'[LOGGED] tier={tier} | "{short_q}" | response {len(response)} chars')
